@@ -47,7 +47,7 @@ openclaw plugins install -l .
 ## 更新
 
 ```
-openclaw plugins update dingtalk
+openclaw plugins update openclaw-dingtalk
 ```
 
 ## 配置
