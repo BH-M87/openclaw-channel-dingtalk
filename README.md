@@ -19,7 +19,7 @@
 手动通过 npm 包名安装：
 
 ```bash
-openclaw plugins install openclaw-dingtalk
+openclaw plugins install @soimy/dingtalk
 ```
 
 ### 方法 B：通过本地源码安装
@@ -47,7 +47,7 @@ openclaw plugins install -l .
 ## 更新
 
 ```
-openclaw plugins update openclaw-dingtalk
+openclaw plugins update @soimy/dingtalk
 ```
 
 ## 配置

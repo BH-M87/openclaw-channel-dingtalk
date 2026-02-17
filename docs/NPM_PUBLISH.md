@@ -59,16 +59,10 @@ npm run prepublishOnly
 ### 4. 发布到 npm
 
 ```bash
-npm run publish
-```
-
-或直接使用：
-
-```bash
 npm publish --access public
 ```
 
-**注意**：由于这是 scoped package (`openclaw-dingtalk`)，必须使用 `--access public` 标志。
+**注意**：由于这是 scoped package (`@soimy/dingtalk`)，必须使用 `--access public` 标志。
 
 ### 5. 验证发布
 
@@ -76,13 +70,13 @@ npm publish --access public
 
 ```bash
 # 查看包信息
-npm info openclaw-dingtalk
+npm info @soimy/dingtalk
 
 # 查看最新版本
-npm view openclaw-dingtalk version
+npm view @soimy/dingtalk version
 
 # 查看包内容
-npm view openclaw-dingtalk
+npm view @soimy/dingtalk
 ```
 
 ### 6. 测试安装
@@ -91,10 +85,10 @@ npm view openclaw-dingtalk
 
 ```bash
 # 通过 OpenClaw CLI 安装
-openclaw plugins install openclaw-dingtalk
+openclaw plugins install @soimy/dingtalk
 
 # 或通过 npm 直接安装（仅测试）
-npm install openclaw-dingtalk
+npm install @soimy/dingtalk
 ```
 
 ## 发布检查清单
@@ -119,7 +113,6 @@ npm install openclaw-dingtalk
 **包含的文件：**
 - `index.ts` - 插件入口
 - `src/` - 源代码目录
-- `utils.ts` - 工具函数
 - `package.json` - 包配置
 - `README.md` - 使用文档
 - `openclaw.plugin.json` - 插件元数据
@@ -146,7 +139,7 @@ npm install openclaw-dingtalk
 **A:** 在发布后 72 小时内可以撤销：
 
 ```bash
-npm unpublish openclaw-dingtalk@版本号
+npm unpublish @soimy/dingtalk@版本号
 ```
 
 **警告**：不建议撤销已被用户使用的版本，应发布修复版本。
@@ -166,7 +159,7 @@ npm publish --access public --tag beta
 用户可通过以下方式安装：
 
 ```bash
-openclaw plugins install openclaw-dingtalk@beta
+openclaw plugins install @soimy/dingtalk@beta
 ```
 
 ## 参考资源
