@@ -65,6 +65,9 @@ const CARD_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 // DingTalk API base URL
 const DINGTALK_API = 'https://api.dingtalk.com';
 
+// Thinking and tool usage message truncate length
+const THINKING_TRUNCATE_LENGTH = 500;
+
 // ============ Message Deduplication ============
 // Prevents duplicate message processing when DingTalk retries delivery
 // Uses pure in-memory storage with short TTL and lazy cleanup during processing
@@ -916,6 +919,29 @@ async function createAICard(
 }
 
 /**
+ * Format thinking/tool content for display in AI Card
+ * Truncates to configured length and adds "> " prefix to each line
+ */
+function formatContentForCard(content: string, type: 'thinking' | 'tool'): string {
+  if (!content) return '';
+
+  // truncate to configured length, add ellipsis if truncated
+  const truncated = content.slice(0, THINKING_TRUNCATE_LENGTH) + (content.length > THINKING_TRUNCATE_LENGTH ? '…' : '');
+
+  // split into lines, then escape leading/trailing underscore per line, then prefix with ">"
+  const quotedLines = truncated
+    .split('\n')
+    .map((line) => line.replace(/^_(?=[^ ])/, '*').replace(/(?<=[^ ])_(?=$)/, '*'))
+    .map((line) => `> ${line}`)
+    .join('\n');
+
+  const emoji = type === 'thinking' ? '🤔' : '🛠️';
+  const label = type === 'thinking' ? '思考中' : '工具执行';
+
+  return `${emoji} **${label}**\n${quotedLines}`;
+}
+
+/**
  * Stream update AI Card content using the new DingTalk API
  * Always use isFull=true to fully replace the Markdown content
  * @param card AI Card instance
@@ -1355,10 +1381,23 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
     cfg,
     dispatcherOptions: {
       responsePrefix: '',
-      deliver: async (payload: any) => {
+      deliver: async (payload: any, info?: { kind: string }) => {
         try {
           const textToSend = payload.markdown || payload.text;
           if (!textToSend) return;
+
+          // Handle tool results separately for AI Card streaming
+          //
+          // Note: use /verbose on in conversation to get tool execution info
+          //
+          if (useCardMode && currentAICard && info?.kind === 'tool') {
+            log?.info?.(`[DingTalk] Tool result received, streaming to AI Card: ${textToSend.slice(0, 100)}`);
+            const toolText = formatContentForCard(textToSend, 'tool');
+            if (toolText) {
+              await streamAICard(currentAICard, toolText, false, log);
+              return; // Don't send via sendMessage for tool results in card mode
+            }
+          }
 
           lastCardContent = textToSend;
           await sendMessage(dingtalkConfig, to, textToSend, {
@@ -1370,6 +1409,21 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
         } catch (err: any) {
           log?.error?.(`[DingTalk] Reply failed: ${err.message}`);
           throw err;
+        }
+      },
+    },
+    replyOptions: {
+      // Handle reasoning stream updates to update the AI Card content in real-time
+      // Note: use /reasoning stream in conversation to get reasoning stream updates
+      //
+      onReasoningStream: async (payload: any) => {
+        if (!useCardMode || !currentAICard) { return; }
+        const thinkingText = formatContentForCard(payload.text, 'thinking');
+        if (!thinkingText) return;
+        try {
+          await streamAICard(currentAICard, thinkingText, false, log);
+        } catch (err: any) {
+          log?.debug?.(`[DingTalk] Thinking stream update failed: ${err.message}`);
         }
       },
     },
@@ -1464,7 +1518,8 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       };
     },
     defaultAccountId: (): string => 'default',
-    isConfigured: (account: ResolvedAccount): boolean => Boolean(account.config?.clientId && account.config?.clientSecret),
+    isConfigured: (account: ResolvedAccount): boolean =>
+      Boolean(account.config?.clientId && account.config?.clientSecret),
     describeAccount: (account: ResolvedAccount) => ({
       accountId: account.accountId,
       name: account.config?.name || 'DingTalk',
@@ -1525,7 +1580,9 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         }
         throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendText failed');
+        throw new Error(
+          typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendText failed'
+        );
       }
     },
     sendMedia: async ({
@@ -1588,7 +1645,9 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         }
         throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendMedia failed');
+        throw new Error(
+          typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendMedia failed'
+        );
       }
     },
   },
