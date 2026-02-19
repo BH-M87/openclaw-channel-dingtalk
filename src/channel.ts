@@ -1104,9 +1104,57 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
 
       log?.debug?.(`[DingTalk] DM authorized: senderId=${senderId} in allowlist`);
     } else if (dmPolicy === 'pairing') {
-      // For pairing mode, SDK will handle the authorization
-      // Set commandAuthorized to true to let SDK check pairing status
-      commandAuthorized = true;
+      // Pairing mode: check if sender is in the allow-from store (paired users)
+      // Read paired users from the persistent store
+      const storeAllowFrom = await rt.channel.pairing.readAllowFromStore('dingtalk').catch(() => []);
+      const effectiveAllowFrom = [...allowFrom.map(String), ...storeAllowFrom];
+      const normalizedEffective = normalizeAllowFrom(effectiveAllowFrom);
+      // Note: cannot use isSenderAllowed here because it returns true for empty lists.
+      // For pairing mode, empty list means nobody is paired yet.
+      const isPaired = normalizedEffective.hasEntries && (
+        normalizedEffective.hasWildcard ||
+        (senderId ? normalizedEffective.entriesLower.includes(senderId.toLowerCase()) : false)
+      );
+
+      if (!isPaired) {
+        // User is not paired — create a pairing request
+        const { code, created } = await rt.channel.pairing.upsertPairingRequest({
+          channel: 'dingtalk',
+          id: senderId,
+          meta: { name: senderName },
+        });
+
+        if (created) {
+          log?.info?.(`[DingTalk] Pairing request created: senderId=${senderId} name=${senderName}`);
+        }
+
+        // Send pairing reply to user
+        try {
+          const pairingReply = rt.channel.pairing.buildPairingReply({
+            channel: 'dingtalk',
+            idLine: `Your DingTalk User ID: ${senderId}`,
+            code,
+          });
+          await sendBySession(dingtalkConfig, sessionWebhook, pairingReply, { log });
+        } catch (err: any) {
+          log?.debug?.(`[DingTalk] Failed to send pairing reply: ${err.message}`);
+        }
+
+        // Block the message — user must be paired first
+        return;
+      }
+
+      log?.debug?.(`[DingTalk] DM authorized via pairing: senderId=${senderId}`);
+      // Compute commandAuthorized for paired users
+      const shouldCompute = rt.channel.commands.shouldComputeCommandAuthorized(content.text, cfg);
+      if (shouldCompute) {
+        commandAuthorized = rt.channel.commands.resolveCommandAuthorizedFromAuthorizers({
+          useAccessGroups: cfg.commands?.useAccessGroups !== false,
+          authorizers: [
+            { configured: normalizedEffective.hasEntries, allowed: true },
+          ],
+        });
+      }
     } else {
       // 'open' policy - allow all
       commandAuthorized = true;
@@ -1375,6 +1423,17 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
     media: true,
     nativeCommands: false,
     blockStreaming: false,
+  },
+  pairing: {
+    idLabel: 'DingTalk User ID',
+    notifyApproval: async ({ cfg, id }) => {
+      try {
+        const config = getConfig(cfg);
+        await sendMessage(config, id, '✅ OpenClaw access approved. Send a message to start chatting.', {});
+      } catch (err: any) {
+        // Best-effort notification — approval still succeeds even if message fails
+      }
+    },
   },
   reload: { configPrefixes: ['channels.dingtalk'] },
   config: {
