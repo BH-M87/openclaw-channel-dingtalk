@@ -30,6 +30,46 @@ import type {
 import { ConnectionState } from "./types";
 import { cleanupOrphanedTempFiles, getCurrentTimestamp } from "./utils";
 
+const processingDedupKeys = new Set<string>();
+const inboundCountersByAccount = new Map<
+  string,
+  {
+    received: number;
+    acked: number;
+    dedupSkipped: number;
+    inflightSkipped: number;
+    processed: number;
+    failed: number;
+    noMessageId: number;
+  }
+>();
+const INBOUND_COUNTER_LOG_EVERY = 10;
+
+function getInboundCounters(accountId: string) {
+  const existing = inboundCountersByAccount.get(accountId);
+  if (existing) {
+    return existing;
+  }
+  const created = {
+    received: 0,
+    acked: 0,
+    dedupSkipped: 0,
+    inflightSkipped: 0,
+    processed: 0,
+    failed: 0,
+    noMessageId: 0,
+  };
+  inboundCountersByAccount.set(accountId, created);
+  return created;
+}
+
+function logInboundCounters(log: any, accountId: string, reason: string): void {
+  const stats = getInboundCounters(accountId);
+  log?.info?.(
+    `[${accountId}] Inbound counters (${reason}): received=${stats.received}, acked=${stats.acked}, processed=${stats.processed}, dedupSkipped=${stats.dedupSkipped}, inflightSkipped=${stats.inflightSkipped}, failed=${stats.failed}, noMessageId=${stats.noMessageId}`,
+  );
+}
+
 // DingTalk Channel Definition (assembly layer).
 // Heavy logic is delegated to service modules for maintainability.
 export const dingtalkPlugin: DingTalkChannelPlugin = {
@@ -254,36 +294,75 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
 
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
         const messageId = res.headers?.messageId;
+        const stats = getInboundCounters(account.accountId);
+        stats.received += 1;
         try {
           if (messageId) {
             client.socketCallBackResponse(messageId, { success: true });
+            stats.acked += 1;
           }
           const data = JSON.parse(res.data) as DingTalkInboundMessage;
 
           // Message deduplication key is bot-scoped to avoid cross-account conflicts.
           const robotKey = config.robotCode || config.clientId || account.accountId;
           const msgId = data.msgId || messageId;
+          const dedupKey = msgId ? `${robotKey}:${msgId}` : undefined;
 
-          if (!msgId) {
+          if (!dedupKey) {
             ctx.log?.warn?.(`[${account.accountId}] No message ID available for deduplication`);
-          } else {
-            const dedupKey = `${robotKey}:${msgId}`;
-            if (isMessageProcessed(dedupKey)) {
-              ctx.log?.debug?.(`[${account.accountId}] Skipping duplicate message: ${dedupKey}`);
-              return;
+            stats.noMessageId += 1;
+            await handleDingTalkMessage({
+              cfg,
+              accountId: account.accountId,
+              data,
+              sessionWebhook: data.sessionWebhook,
+              log: ctx.log,
+              dingtalkConfig: config,
+            });
+            stats.processed += 1;
+            if (stats.received % INBOUND_COUNTER_LOG_EVERY === 0) {
+              logInboundCounters(ctx.log, account.accountId, "periodic");
             }
-            markMessageProcessed(dedupKey);
+            return;
           }
 
-          await handleDingTalkMessage({
-            cfg,
-            accountId: account.accountId,
-            data,
-            sessionWebhook: data.sessionWebhook,
-            log: ctx.log,
-            dingtalkConfig: config,
-          });
+          if (isMessageProcessed(dedupKey)) {
+            ctx.log?.debug?.(`[${account.accountId}] Skipping duplicate message: ${dedupKey}`);
+            stats.dedupSkipped += 1;
+            logInboundCounters(ctx.log, account.accountId, "dedup-skipped");
+            return;
+          }
+
+          if (processingDedupKeys.has(dedupKey)) {
+            ctx.log?.debug?.(
+              `[${account.accountId}] Skipping in-flight duplicate message: ${dedupKey}`,
+            );
+            stats.inflightSkipped += 1;
+            logInboundCounters(ctx.log, account.accountId, "inflight-skipped");
+            return;
+          }
+
+          processingDedupKeys.add(dedupKey);
+          try {
+            await handleDingTalkMessage({
+              cfg,
+              accountId: account.accountId,
+              data,
+              sessionWebhook: data.sessionWebhook,
+              log: ctx.log,
+              dingtalkConfig: config,
+            });
+            stats.processed += 1;
+            markMessageProcessed(dedupKey);
+            if (stats.received % INBOUND_COUNTER_LOG_EVERY === 0) {
+              logInboundCounters(ctx.log, account.accountId, "periodic");
+            }
+          } finally {
+            processingDedupKeys.delete(dedupKey);
+          }
         } catch (error: any) {
+          stats.failed += 1;
+          logInboundCounters(ctx.log, account.accountId, "failed");
           ctx.log?.error?.(`[${account.accountId}] Error processing message: ${error.message}`);
         }
       });

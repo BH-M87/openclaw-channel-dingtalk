@@ -60,6 +60,8 @@ vi.mock('../../src/inbound-handler', () => ({
 
 import { dingtalkPlugin } from '../../src/channel';
 
+const startGatewayAccount = (ctx: any) => dingtalkPlugin.gateway!.startAccount!(ctx);
+
 function createStartContext() {
     let status = {
         accountId: 'main',
@@ -109,7 +111,7 @@ describe('gateway inbound callback pipeline', () => {
         shared.isMessageProcessedMock.mockReturnValue(false);
         const ctx = createStartContext();
 
-        await dingtalkPlugin.gateway.startAccount(ctx as any);
+        await startGatewayAccount(ctx as any);
 
         expect(shared.listener).toBeTypeOf('function');
 
@@ -142,7 +144,7 @@ describe('gateway inbound callback pipeline', () => {
         shared.isMessageProcessedMock.mockReturnValue(true);
         const ctx = createStartContext();
 
-        await dingtalkPlugin.gateway.startAccount(ctx as any);
+        await startGatewayAccount(ctx as any);
 
         await shared.listener?.({
             headers: { messageId: 'stream_msg_2' },
@@ -160,5 +162,83 @@ describe('gateway inbound callback pipeline', () => {
 
         expect(shared.markMessageProcessedMock).not.toHaveBeenCalled();
         expect(shared.handleDingTalkMessageMock).not.toHaveBeenCalled();
+        expect(ctx.log.info).toHaveBeenCalledWith(
+            expect.stringContaining('Inbound counters (dedup-skipped)')
+        );
+    });
+
+    it('does not mark dedup when handler fails, allowing retries', async () => {
+        shared.isMessageProcessedMock.mockReturnValue(false);
+        shared.handleDingTalkMessageMock
+            .mockRejectedValueOnce(new Error('transient failure'))
+            .mockResolvedValueOnce(undefined);
+        const ctx = createStartContext();
+
+        await startGatewayAccount(ctx as any);
+
+        const payload = {
+            headers: { messageId: 'stream_msg_retry' },
+            data: JSON.stringify({
+                msgId: 'msg_retry',
+                msgtype: 'text',
+                text: { content: 'retry me' },
+                conversationType: '1',
+                conversationId: 'cidA1B2C3',
+                senderId: 'user_1',
+                chatbotUserId: 'bot_1',
+                sessionWebhook: 'https://webhook',
+            }),
+        };
+
+        await shared.listener?.(payload);
+        expect(shared.markMessageProcessedMock).not.toHaveBeenCalled();
+        expect(ctx.log.info).toHaveBeenCalledWith(expect.stringContaining('Inbound counters (failed)'));
+
+        await shared.listener?.(payload);
+        expect(shared.handleDingTalkMessageMock).toHaveBeenCalledTimes(2);
+        expect(shared.markMessageProcessedMock).toHaveBeenCalledTimes(1);
+        expect(shared.markMessageProcessedMock).toHaveBeenCalledWith('robot_1:msg_retry');
+    });
+
+    it('skips concurrent in-flight duplicate callbacks for same message', async () => {
+        shared.isMessageProcessedMock.mockReturnValue(false);
+        let resolveFirst: (() => void) | undefined;
+        shared.handleDingTalkMessageMock.mockImplementationOnce(
+            () =>
+                new Promise<void>((resolve) => {
+                    resolveFirst = resolve;
+                })
+        );
+        const ctx = createStartContext();
+
+        await startGatewayAccount(ctx as any);
+
+        const payload = {
+            headers: { messageId: 'stream_msg_inflight' },
+            data: JSON.stringify({
+                msgId: 'msg_inflight',
+                msgtype: 'text',
+                text: { content: 'in flight' },
+                conversationType: '1',
+                conversationId: 'cidA1B2C3',
+                senderId: 'user_1',
+                chatbotUserId: 'bot_1',
+                sessionWebhook: 'https://webhook',
+            }),
+        };
+
+        const first = shared.listener?.(payload);
+        const second = shared.listener?.(payload);
+
+        await Promise.resolve();
+        expect(shared.handleDingTalkMessageMock).toHaveBeenCalledTimes(1);
+        expect(shared.markMessageProcessedMock).not.toHaveBeenCalled();
+
+        resolveFirst?.();
+        await first;
+        await second;
+
+        expect(shared.markMessageProcessedMock).toHaveBeenCalledTimes(1);
+        expect(shared.markMessageProcessedMock).toHaveBeenCalledWith('robot_1:msg_inflight');
     });
 });
