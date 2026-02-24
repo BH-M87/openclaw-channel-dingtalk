@@ -23,7 +23,9 @@ function applyAccountNameToChannelSection(params: {
   name?: string;
 }): OpenClawConfig {
   const { cfg, channelKey, name } = params;
-  if (!name) return cfg;
+  if (!name) {
+    return cfg;
+  }
   const base = cfg.channels?.[channelKey] as DingTalkChannelConfig | undefined;
   return {
     ...cfg,

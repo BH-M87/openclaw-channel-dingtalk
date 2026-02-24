@@ -1,899 +1,72 @@
-import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
-import axios from 'axios';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import type { OpenClawConfig } from 'openclaw/plugin-sdk';
-import { buildChannelConfigSchema } from 'openclaw/plugin-sdk';
-import { maskSensitiveData, cleanupOrphanedTempFiles, retryWithBackoff } from './utils';
-import { getDingTalkRuntime } from './runtime';
-import { DingTalkConfigSchema } from './config-schema.js';
-import { registerPeerId, resolveOriginalPeerId } from './peer-id-registry';
-import { ConnectionManager } from './connection-manager';
-import { dingtalkOnboardingAdapter } from './onboarding.js';
+import { randomUUID } from "node:crypto";
+import { DWClient, TOPIC_ROBOT } from "dingtalk-stream";
+import type { OpenClawConfig } from "openclaw/plugin-sdk";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk";
+import { getAccessToken } from "./auth";
+import { createAICard, streamAICard, finishAICard } from "./card-service";
+import { getConfig, isConfigured, resolveRelativePath, stripTargetPrefix } from "./config";
+import { DingTalkConfigSchema } from "./config-schema.js";
+import { ConnectionManager } from "./connection-manager";
+import { isMessageProcessed, markMessageProcessed } from "./dedup";
+import { handleDingTalkMessage } from "./inbound-handler";
+import { getLogger } from "./logger-context";
+import { dingtalkOnboardingAdapter } from "./onboarding.js";
+import { resolveOriginalPeerId } from "./peer-id-registry";
+import {
+  detectMediaTypeFromExtension,
+  sendMessage,
+  sendProactiveMedia,
+  sendBySession,
+  uploadMedia,
+} from "./send-service";
 import type {
-  DingTalkConfig,
-  TokenInfo,
   DingTalkInboundMessage,
-  MessageContent,
-  SendMessageOptions,
-  MediaFile,
-  HandleDingTalkMessageParams,
-  ProactiveMessagePayload,
-  SessionWebhookResponse,
-  AxiosResponse,
-  Logger,
-  ResolvedAccount,
   GatewayStartContext,
   GatewayStopResult,
-  AICardInstance,
-  AICardStreamingRequest,
   ConnectionManagerConfig,
   DingTalkChannelPlugin,
-} from './types';
-import { AICardStatus, ConnectionState } from './types';
-import { detectMediaTypeFromExtension, uploadMedia as uploadMediaUtil } from './media-utils';
+  ResolvedAccount,
+} from "./types";
+import { ConnectionState } from "./types";
+import { cleanupOrphanedTempFiles, getCurrentTimestamp } from "./utils";
 
-/**
- * Get current timestamp in ISO 8601 format for status tracking
- */
-function getCurrentTimestamp(): number {
-  return Date.now();
-}
-
-// Access Token cache - keyed by clientId for multi-account support
-interface TokenCache {
-  accessToken: string;
-  expiry: number;
-}
-const accessTokenCache = new Map<string, TokenCache>();
-
-// Global logger reference for use across module methods
-let currentLogger: Logger | undefined;
-
-// AI Card instance cache for streaming updates
-const aiCardInstances = new Map<string, AICardInstance>();
-
-// Target to active AI Card instance ID mapping (accountId:conversationId -> cardInstanceId)
-// Used to quickly lookup existing active cards for a target
-const activeCardsByTarget = new Map<string, string>();
-
-// Card cache TTL (1 hour)
-const CARD_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-
-// DingTalk API base URL
-const DINGTALK_API = 'https://api.dingtalk.com';
-
-// ============ Message Deduplication ============
-// Prevents duplicate message processing when DingTalk retries delivery
-// Uses pure in-memory storage with short TTL and lazy cleanup during processing
-
-const processedMessages = new Map<string, number>(); // Map<dedupKey, expiresAt>
-const MESSAGE_DEDUP_TTL = 60000; // 60 seconds
-const MESSAGE_DEDUP_MAX_SIZE = 1000; // Hard cap to prevent memory pressure during bursts
-let messageCounter = 0; // Counter for deterministic cleanup triggering (safe due to Node.js single-threaded event loop)
-
-// Check if message was already processed (with lazy cleanup of expired entries)
-function isMessageProcessed(dedupKey: string): boolean {
-  const now = Date.now();
-  const expiresAt = processedMessages.get(dedupKey);
-
-  if (expiresAt === undefined) {
-    return false;
+const processingDedupKeys = new Set<string>();
+const inboundCountersByAccount = new Map<
+  string,
+  {
+    received: number;
+    acked: number;
+    dedupSkipped: number;
+    inflightSkipped: number;
+    processed: number;
+    failed: number;
+    noMessageId: number;
   }
+>();
+const INBOUND_COUNTER_LOG_EVERY = 10;
 
-  // Lazy cleanup: remove expired entry if found
-  if (now >= expiresAt) {
-    processedMessages.delete(dedupKey);
-    return false;
+function getInboundCounters(accountId: string) {
+  const existing = inboundCountersByAccount.get(accountId);
+  if (existing) {
+    return existing;
   }
-
-  return true;
-}
-
-// Mark message as processed with bot-scoped key
-function markMessageProcessed(dedupKey: string): void {
-  const expiresAt = Date.now() + MESSAGE_DEDUP_TTL;
-  processedMessages.set(dedupKey, expiresAt);
-
-  // Hard cap: if Map exceeds max size, force immediate cleanup
-  if (processedMessages.size > MESSAGE_DEDUP_MAX_SIZE) {
-    const now = Date.now();
-    for (const [key, expiry] of processedMessages.entries()) {
-      if (now >= expiry) {
-        processedMessages.delete(key);
-      }
-    }
-    // If still over limit after cleanup, clear oldest entries (safety valve)
-    // Maps maintain insertion order, so we can delete early entries
-    if (processedMessages.size > MESSAGE_DEDUP_MAX_SIZE) {
-      const removeCount = processedMessages.size - MESSAGE_DEDUP_MAX_SIZE;
-      let removed = 0;
-      for (const key of processedMessages.keys()) {
-        processedMessages.delete(key);
-        if (++removed >= removeCount) break;
-      }
-    }
-    return; // Skip regular cleanup since we just did a full sweep
-  }
-
-  // Lazy cleanup: remove expired entries deterministically every 10 messages
-  // With 60s TTL, Map stays small under normal load, but we avoid cleanup on every message for performance
-  messageCounter++;
-  if (messageCounter >= 10) {
-    messageCounter = 0;
-    const now = Date.now();
-    for (const [key, expiry] of processedMessages.entries()) {
-      if (now >= expiry) {
-        processedMessages.delete(key);
-      }
-    }
-  }
-}
-
-// Authorization helpers
-type NormalizedAllowFrom = {
-  entries: string[];
-  entriesLower: string[];
-  hasWildcard: boolean;
-  hasEntries: boolean;
-};
-
-/**
- * Normalize allowFrom list to standardized format
- */
-function normalizeAllowFrom(list?: Array<string>): NormalizedAllowFrom {
-  const entries = (list ?? []).map((value) => String(value).trim()).filter(Boolean);
-  const hasWildcard = entries.includes('*');
-  const normalized = entries
-    .filter((value) => value !== '*')
-    .map((value) => value.replace(/^(dingtalk|dd|ding):/i, ''));
-  const normalizedLower = normalized.map((value) => value.toLowerCase());
-  return {
-    entries: normalized,
-    entriesLower: normalizedLower,
-    hasWildcard,
-    hasEntries: entries.length > 0,
+  const created = {
+    received: 0,
+    acked: 0,
+    dedupSkipped: 0,
+    inflightSkipped: 0,
+    processed: 0,
+    failed: 0,
+    noMessageId: 0,
   };
+  inboundCountersByAccount.set(accountId, created);
+  return created;
 }
 
-/**
- * Check if sender is allowed based on allowFrom list
- */
-function isSenderAllowed(params: { allow: NormalizedAllowFrom; senderId?: string }): boolean {
-  const { allow, senderId } = params;
-  if (!allow.hasEntries) return true;
-  if (allow.hasWildcard) return true;
-  if (senderId && allow.entriesLower.includes(senderId.toLowerCase())) return true;
-  return false;
-}
-
-// 群组通道授权
-function isSenderGroupAllowed(params: { allow: NormalizedAllowFrom; groupId?: string }): boolean {
-  const { allow, groupId } = params;
-
-  if (groupId && allow.entriesLower.includes(groupId.toLowerCase())) return true;
-  return false;
-}
-
-// Helper function to check if a card is in a terminal state
-function isCardInTerminalState(state: string): boolean {
-  return state === AICardStatus.FINISHED || state === AICardStatus.FAILED;
-}
-
-// Clean up old AI card instances from cache
-function cleanupCardCache() {
-  const now = Date.now();
-
-  // Clean up AI card instances that are in FINISHED or FAILED state
-  // Active cards (PROCESSING, INPUTING) are not cleaned up even if they exceed TTL
-  for (const [cardInstanceId, instance] of aiCardInstances.entries()) {
-    if (isCardInTerminalState(instance.state) && now - instance.lastUpdated > CARD_CACHE_TTL) {
-      // Remove from aiCardInstances
-      aiCardInstances.delete(cardInstanceId);
-
-      // Remove from activeCardsByTarget mapping (break after first match for efficiency)
-      for (const [targetKey, mappedCardId] of activeCardsByTarget.entries()) {
-        if (mappedCardId === cardInstanceId) {
-          activeCardsByTarget.delete(targetKey);
-          break; // Each card should only have one target mapping
-        }
-      }
-    }
-  }
-}
-
-/**
- * Get the current logger instance
- * Useful for methods that don't receive log as a parameter
- */
-function getLogger(): Logger | undefined {
-  return currentLogger;
-}
-
-// Helper function to detect markdown and extract title
-function detectMarkdownAndExtractTitle(
-  text: string,
-  options: SendMessageOptions,
-  defaultTitle: string
-): { useMarkdown: boolean; title: string } {
-  const hasMarkdown = /^[#*>-]|[*_`#[\]]/.test(text) || text.includes('\n');
-  const useMarkdown = options.useMarkdown !== false && (options.useMarkdown || hasMarkdown);
-
-  const title =
-    options.title ||
-    (useMarkdown
-      ? text
-          .split('\n')[0]
-          .replace(/^[#*\s\->]+/, '')
-          .slice(0, 20) || defaultTitle
-      : defaultTitle);
-
-  return { useMarkdown, title };
-}
-
-// ============ Group Members Persistence ============
-
-function groupMembersFilePath(storePath: string, groupId: string): string {
-  const dir = path.join(path.dirname(storePath), 'dingtalk-members');
-  const safeId = groupId.replace(/\+/g, '-').replace(/\//g, '_');
-  return path.join(dir, `${safeId}.json`);
-}
-
-function noteGroupMember(storePath: string, groupId: string, userId: string, name: string): void {
-  if (!userId || !name) return;
-  const filePath = groupMembersFilePath(storePath, groupId);
-  let roster: Record<string, string> = {};
-  try {
-    roster = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  } catch {}
-  if (roster[userId] === name) return;
-  roster[userId] = name;
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(roster, null, 2));
-}
-
-function formatGroupMembers(storePath: string, groupId: string): string | undefined {
-  const filePath = groupMembersFilePath(storePath, groupId);
-  let roster: Record<string, string> = {};
-  try {
-    roster = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  } catch {
-    return undefined;
-  }
-  const entries = Object.entries(roster);
-  if (entries.length === 0) return undefined;
-  return entries.map(([id, name]) => `${name} (${id})`).join(', ');
-}
-
-// ============ Group Config Resolution ============
-
-function resolveGroupConfig(cfg: DingTalkConfig, groupId: string): { systemPrompt?: string } | undefined {
-  const groups = cfg.groups;
-  if (!groups) return undefined;
-  return groups[groupId] || groups['*'] || undefined;
-}
-
-// ============ Target Prefix Helpers ============
-
-/**
- * Strip group: or user: prefix from target ID
- * Returns the raw targetId and whether it was explicitly marked as a user
- */
-function stripTargetPrefix(target: string): { targetId: string; isExplicitUser: boolean } {
-  if (target.startsWith('group:')) {
-    return { targetId: target.slice(6), isExplicitUser: false };
-  }
-  if (target.startsWith('user:')) {
-    return { targetId: target.slice(5), isExplicitUser: true };
-  }
-  return { targetId: target, isExplicitUser: false };
-}
-
-// ============ Config Helpers ============
-
-function getConfig(cfg: OpenClawConfig, accountId?: string): DingTalkConfig {
-  const dingtalkCfg = cfg?.channels?.dingtalk as DingTalkConfig | undefined;
-  if (!dingtalkCfg) return {} as DingTalkConfig;
-
-  if (accountId && dingtalkCfg.accounts?.[accountId]) {
-    return dingtalkCfg.accounts[accountId];
-  }
-
-  return dingtalkCfg;
-}
-
-function isConfigured(cfg: OpenClawConfig, accountId?: string): boolean {
-  const config = getConfig(cfg, accountId);
-  return Boolean(config.clientId && config.clientSecret);
-}
-
-const DEFAULT_AGENT_ID = 'main';
-const VALID_AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
-const INVALID_AGENT_ID_CHARS_RE = /[^a-z0-9_-]+/g;
-const LEADING_DASH_RE = /^-+/;
-const TRAILING_DASH_RE = /-+$/;
-
-function normalizeAgentId(value: string | undefined | null): string {
-  const trimmed = (value ?? '').trim();
-  if (!trimmed) return DEFAULT_AGENT_ID;
-  if (VALID_AGENT_ID_RE.test(trimmed)) return trimmed.toLowerCase();
-  return (
-    trimmed
-      .toLowerCase()
-      .replace(INVALID_AGENT_ID_CHARS_RE, '-')
-      .replace(LEADING_DASH_RE, '')
-      .replace(TRAILING_DASH_RE, '')
-      .slice(0, 64) || DEFAULT_AGENT_ID
-  );
-}
-
-function resolveUserPath(input: string): string {
-  const trimmed = input.trim();
-  if (!trimmed) return trimmed;
-  if (trimmed.startsWith('~')) {
-    const expanded = trimmed.replace(/^~(?=$|[\\/])/, os.homedir());
-    return path.resolve(expanded);
-  }
-  return path.resolve(trimmed);
-}
-
-function resolveDefaultAgentWorkspaceDir(): string {
-  const profile = process.env.OPENCLAW_PROFILE?.trim();
-  if (profile && profile.toLowerCase() !== 'default') {
-    return path.join(os.homedir(), '.openclaw', `workspace-${profile}`);
-  }
-  return path.join(os.homedir(), '.openclaw', 'workspace');
-}
-
-interface AgentConfig {
-  id?: string;
-  default?: boolean;
-  workspace?: string;
-}
-
-function resolveDefaultAgentId(cfg: OpenClawConfig): string {
-  const agents: AgentConfig[] = cfg.agents?.list ?? [];
-  if (agents.length === 0) return DEFAULT_AGENT_ID;
-  const defaults = agents.filter((agent: AgentConfig) => agent?.default);
-  const chosen = (defaults[0] ?? agents[0])?.id?.trim();
-  return normalizeAgentId(chosen || DEFAULT_AGENT_ID);
-}
-
-function resolveAgentWorkspaceDir(cfg: OpenClawConfig, agentId: string): string {
-  const id = normalizeAgentId(agentId);
-  const agents: AgentConfig[] = cfg.agents?.list ?? [];
-  const agent = agents.find((entry: AgentConfig) => normalizeAgentId(entry?.id) === id);
-  const configured = agent?.workspace?.trim();
-  if (configured) return resolveUserPath(configured);
-  const defaultAgentId = resolveDefaultAgentId(cfg);
-  if (id === defaultAgentId) {
-    const fallback = cfg.agents?.defaults?.workspace?.trim();
-    if (fallback) return resolveUserPath(fallback);
-    return resolveDefaultAgentWorkspaceDir();
-  }
-  return path.join(os.homedir(), '.openclaw', `workspace-${id}`);
-}
-
-// Get Access Token with retry logic - uses clientId-based cache for multi-account support
-async function getAccessToken(config: DingTalkConfig, log?: Logger): Promise<string> {
-  const cacheKey = config.clientId;
-  const now = Date.now();
-  const cached = accessTokenCache.get(cacheKey);
-
-  if (cached && cached.expiry > now + 60000) {
-    return cached.accessToken;
-  }
-
-  const token = await retryWithBackoff(
-    async () => {
-      const response = await axios.post<TokenInfo>('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
-        appKey: config.clientId,
-        appSecret: config.clientSecret,
-      });
-
-      // Store in cache with clientId as key
-      accessTokenCache.set(cacheKey, {
-        accessToken: response.data.accessToken,
-        expiry: now + response.data.expireIn * 1000,
-      });
-
-      return response.data.accessToken;
-    },
-    { maxRetries: 3, log }
-  );
-
-  return token;
-}
-
-// Wrapper function to upload media via uploadMediaUtil with getAccessToken bound
-async function uploadMedia(
-  config: DingTalkConfig,
-  mediaPath: string,
-  mediaType: 'image' | 'voice' | 'video' | 'file',
-  log?: Logger
-): Promise<string | null> {
-  return uploadMediaUtil(config, mediaPath, mediaType, getAccessToken, log);
-}
-
-// Send text/markdown proactive message via DingTalk OpenAPI
-async function sendProactiveTextOrMarkdown(
-  config: DingTalkConfig,
-  target: string,
-  text: string,
-  options: SendMessageOptions = {}
-): Promise<AxiosResponse> {
-  const token = await getAccessToken(config, options.log);
-  const log = options.log || getLogger();
-
-  // Support group: and user: prefixes, and resolve case-sensitive conversationId
-  const { targetId, isExplicitUser } = stripTargetPrefix(target);
-  const resolvedTarget = resolveOriginalPeerId(targetId);
-  const isGroup = !isExplicitUser && resolvedTarget.startsWith('cid');
-
-  const url = isGroup
-    ? 'https://api.dingtalk.com/v1.0/robot/groupMessages/send'
-    : 'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend';
-
-  // Use shared helper function for markdown detection and title extraction
-  const { useMarkdown, title } = detectMarkdownAndExtractTitle(text, options, 'OpenClaw 提醒');
-
-  log?.debug?.(
-    `[DingTalk] Sending proactive message to ${isGroup ? 'group' : 'user'} ${resolvedTarget} with title "${title}"`
-  );
-
-  // Choose msgKey based on whether we're sending markdown or plain text
-  // Note: DingTalk's proactive message API uses predefined message templates
-  // sampleMarkdown supports markdown formatting, sampleText for plain text
-  const msgKey = useMarkdown ? 'sampleMarkdown' : 'sampleText';
-  const msgParam = useMarkdown ? JSON.stringify({ title, text }) : JSON.stringify({ content: text });
-
-  const payload: ProactiveMessagePayload = {
-    robotCode: config.robotCode || config.clientId,
-    msgKey,
-    msgParam,
-  };
-
-  if (isGroup) {
-    payload.openConversationId = resolvedTarget;
-  } else {
-    payload.userIds = [resolvedTarget];
-  }
-
-  const result = await axios({
-    url,
-    method: 'POST',
-    data: payload,
-    headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-  });
-  return result.data;
-}
-
-// Send proactive media message via DingTalk OpenAPI
-async function sendProactiveMedia(
-  config: DingTalkConfig,
-  target: string,
-  mediaPath: string,
-  mediaType: 'image' | 'voice' | 'video' | 'file',
-  options: SendMessageOptions & { accountId?: string } = {}
-): Promise<{ ok: boolean; error?: string; data?: any; messageId?: string }> {
-  const log = options.log || getLogger();
-
-  try {
-    // Upload media first to get media_id
-    const mediaId = await uploadMedia(config, mediaPath, mediaType, log);
-    if (!mediaId) {
-      return { ok: false, error: 'Failed to upload media' };
-    }
-
-    const token = await getAccessToken(config, log);
-    const { targetId, isExplicitUser } = stripTargetPrefix(target);
-    const resolvedTarget = resolveOriginalPeerId(targetId);
-    const isGroup = !isExplicitUser && resolvedTarget.startsWith('cid');
-
-    const DINGTALK_API = 'https://api.dingtalk.com';
-    const url = isGroup
-      ? `${DINGTALK_API}/v1.0/robot/groupMessages/send`
-      : `${DINGTALK_API}/v1.0/robot/oToMessages/batchSend`;
-
-    // Build payload based on media type
-    // For personal messages (oToMessages), use native media message types
-    // For group messages (groupMessages), use sampleImageMsg/sampleAudio/etc.
-    let msgKey: string;
-    let msgParam: string;
-
-    if (mediaType === 'image') {
-      msgKey = 'sampleImageMsg';
-      msgParam = JSON.stringify({ photoURL: mediaId });
-    } else if (mediaType === 'voice') {
-      msgKey = 'sampleAudio';
-      msgParam = JSON.stringify({ mediaId, duration: '0' });
-    } else {
-      // File-like media (including video)
-      // Note: sampleVideo requires a cover image (picMediaId) which we don't have,
-      // so we fall back to sampleFile for video to avoid .octet-stream issues.
-      const filename = path.basename(mediaPath);
-      const defaultExt = mediaType === 'video' ? 'mp4' : 'file';
-      const ext = path.extname(mediaPath).slice(1) || defaultExt;
-      msgKey = 'sampleFile';
-      msgParam = JSON.stringify({ mediaId, fileName: filename, fileType: ext });
-    }
-
-    const payload: ProactiveMessagePayload = {
-      robotCode: config.robotCode || config.clientId,
-      msgKey,
-      msgParam,
-    };
-
-    if (isGroup) {
-      payload.openConversationId = resolvedTarget;
-    } else {
-      payload.userIds = [resolvedTarget];
-    }
-
-    log?.debug?.(
-      `[DingTalk] Sending proactive ${mediaType} message to ${isGroup ? 'group' : 'user'} ${resolvedTarget}`
-    );
-
-    const result = await axios({
-      url,
-      method: 'POST',
-      data: payload,
-      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-    });
-
-    const messageId = result.data?.processQueryKey || result.data?.messageId;
-    return { ok: true, data: result.data, messageId };
-  } catch (err: any) {
-    log?.error?.(`[DingTalk] Failed to send proactive media: ${err.message}`);
-    if (axios.isAxiosError(err) && err.response) {
-      log?.error?.(`[DingTalk] Response: ${JSON.stringify(err.response.data)}`);
-    }
-    return { ok: false, error: err.message };
-  }
-}
-
-// Download media file to agent workspace (sandbox-compatible)
-// workspacePath: the agent's workspace directory (e.g., /home/node/.openclaw/workspace)
-async function downloadMedia(
-  config: DingTalkConfig,
-  downloadCode: string,
-  workspacePath: string,
-  log?: Logger
-): Promise<MediaFile | null> {
-  const formatAxiosErrorData = (value: unknown): string | undefined => {
-    if (value === null || value === undefined) return undefined;
-    if (Buffer.isBuffer(value)) return `<buffer ${value.length} bytes>`;
-    if (value instanceof ArrayBuffer) return `<arraybuffer ${value.byteLength} bytes>`;
-    if (typeof value === 'string') return value.length > 500 ? `${value.slice(0, 500)}…` : value;
-    try {
-      return JSON.stringify(maskSensitiveData(value));
-    } catch {
-      return String(value);
-    }
-  };
-
-  if (!downloadCode) {
-    log?.error?.('[DingTalk] downloadMedia requires downloadCode to be provided.');
-    return null;
-  }
-  if (!config.robotCode) {
-    if (log?.error) {
-      log.error('[DingTalk] downloadMedia requires robotCode to be configured.');
-    }
-    return null;
-  }
-  try {
-    const token = await getAccessToken(config, log);
-    const response = await axios.post(
-      'https://api.dingtalk.com/v1.0/robot/messageFiles/download',
-      { downloadCode, robotCode: config.robotCode },
-      { headers: { 'x-acs-dingtalk-access-token': token } }
-    );
-    const payload = response.data as Record<string, any>;
-    const downloadUrl = payload?.downloadUrl ?? payload?.data?.downloadUrl;
-    if (!downloadUrl) {
-      const payloadDetail = formatAxiosErrorData(payload);
-      log?.error?.(`[DingTalk] downloadMedia missing downloadUrl. payload=${payloadDetail ?? 'unknown'}`);
-      return null;
-    }
-    const mediaResponse = await axios.get(downloadUrl, { responseType: 'arraybuffer' });
-    const contentType = mediaResponse.headers['content-type'] || 'application/octet-stream';
-    const buffer = Buffer.from(mediaResponse.data as ArrayBuffer);
-
-    // Save to agent workspace's media/inbound/ directory (sandbox-compatible)
-    // This ensures the file is accessible within the sandbox
-    const mediaDir = path.join(workspacePath, 'media', 'inbound');
-    fs.mkdirSync(mediaDir, { recursive: true });
-
-    const ext = contentType.split('/')[1]?.split(';')[0] || 'bin';
-    const filename = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-    const mediaPath = path.join(mediaDir, filename);
-
-    fs.writeFileSync(mediaPath, buffer);
-    log?.debug?.(`[DingTalk] Media saved to workspace: ${mediaPath}`);
-    return { path: mediaPath, mimeType: contentType };
-  } catch (err: any) {
-    if (log?.error) {
-      if (axios.isAxiosError(err)) {
-        const status = err.response?.status;
-        const statusText = err.response?.statusText;
-        const dataDetail = formatAxiosErrorData(err.response?.data);
-        const code = err.code ? ` code=${err.code}` : '';
-        const statusLabel = status ? ` status=${status}${statusText ? ` ${statusText}` : ''}` : '';
-        log.error(`[DingTalk] Failed to download media:${statusLabel}${code} message=${err.message}`);
-        if (dataDetail) {
-          log.error(`[DingTalk] downloadMedia response data: ${dataDetail}`);
-        }
-      } else {
-        log.error(`[DingTalk] Failed to download media: ${err.message}`);
-      }
-    }
-    return null;
-  }
-}
-
-function extractMessageContent(data: DingTalkInboundMessage): MessageContent {
-  const msgtype = data.msgtype || 'text';
-
-  // Logic for different message types
-  if (msgtype === 'text') {
-    return { text: data.text?.content?.trim() || '', messageType: 'text' };
-  }
-
-  // Improved richText parsing: join all text/at components and extract first picture
-  if (msgtype === 'richText') {
-    const richTextParts = data.content?.richText || [];
-    let text = '';
-    let pictureDownloadCode: string | undefined;
-    for (const part of richTextParts) {
-      // Handle text content: include explicit text type or undefined type field (DingTalk may omit type)
-      if (part.text && (part.type === 'text' || part.type === undefined)) text += part.text;
-      if (part.type === 'at' && part.atName) text += `@${part.atName} `;
-      // Extract first picture's downloadCode from richText
-      if (part.type === 'picture' && part.downloadCode && !pictureDownloadCode) {
-        pictureDownloadCode = part.downloadCode;
-      }
-    }
-    return {
-      text: text.trim() || (pictureDownloadCode ? '<media:image>' : '[富文本消息]'),
-      mediaPath: pictureDownloadCode,
-      mediaType: pictureDownloadCode ? 'image' : undefined,
-      messageType: 'richText',
-    };
-  }
-
-  if (msgtype === 'picture') {
-    return { text: '<media:image>', mediaPath: data.content?.downloadCode, mediaType: 'image', messageType: 'picture' };
-  }
-
-  if (msgtype === 'audio') {
-    return {
-      text: data.content?.recognition || '<media:voice>',
-      mediaPath: data.content?.downloadCode,
-      mediaType: 'audio',
-      messageType: 'audio',
-    };
-  }
-
-  if (msgtype === 'video') {
-    return { text: '<media:video>', mediaPath: data.content?.downloadCode, mediaType: 'video', messageType: 'video' };
-  }
-
-  if (msgtype === 'file') {
-    return {
-      text: `<media:file> (${data.content?.fileName || '文件'})`,
-      mediaPath: data.content?.downloadCode,
-      mediaType: 'file',
-      messageType: 'file',
-    };
-  }
-
-  // Fallback
-  return { text: data.text?.content?.trim() || `[${msgtype}消息]`, messageType: msgtype };
-}
-
-// Send message via sessionWebhook
-async function sendBySession(
-  config: DingTalkConfig,
-  sessionWebhook: string,
-  text: string,
-  options: SendMessageOptions = {}
-): Promise<AxiosResponse> {
-  const token = await getAccessToken(config, options.log);
-  const log = options.log || getLogger();
-
-  // If mediaPath is provided, upload media and send as native media message
-  if (options.mediaPath && options.mediaType) {
-    const mediaId = await uploadMedia(config, options.mediaPath, options.mediaType, log);
-    if (mediaId) {
-      let body: any;
-
-      // Construct message body based on media type
-      if (options.mediaType === 'image') {
-        body = { msgtype: 'image', image: { media_id: mediaId } };
-      } else if (options.mediaType === 'voice') {
-        body = { msgtype: 'voice', voice: { media_id: mediaId } };
-      } else if (options.mediaType === 'video') {
-        body = { msgtype: 'video', video: { media_id: mediaId } };
-      } else if (options.mediaType === 'file') {
-        body = { msgtype: 'file', file: { media_id: mediaId } };
-      }
-
-      if (body) {
-        const result = await axios({
-          url: sessionWebhook,
-          method: 'POST',
-          data: body,
-          headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-        });
-        return result.data;
-      }
-    } else {
-      log?.warn?.('[DingTalk] Media upload failed, falling back to text description');
-    }
-  }
-
-  // Use shared helper function for markdown detection and title extraction
-  const { useMarkdown, title } = detectMarkdownAndExtractTitle(text, options, 'Clawdbot 消息');
-
-  let body: SessionWebhookResponse;
-  if (useMarkdown) {
-    let finalText = text;
-    if (options.atUserId) finalText = `${finalText} @${options.atUserId}`;
-    body = { msgtype: 'markdown', markdown: { title, text: finalText } };
-  } else {
-    body = { msgtype: 'text', text: { content: text } };
-  }
-
-  if (options.atUserId) body.at = { atUserIds: [options.atUserId], isAtAll: false };
-
-  const result = await axios({
-    url: sessionWebhook,
-    method: 'POST',
-    data: body,
-    headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-  });
-  return result.data;
-}
-
-// ============ AI Card API Functions ============
-
-/**
- * Create and deliver an AI Card using the new DingTalk API (createAndDeliver)
- * @param config DingTalk configuration
- * @param conversationId Conversation ID (starts with 'cid' for groups, user ID for DM)
- * @param data Original message data for context
- * @param accountId Account ID for multi-account support
- * @param log Logger instance
- * @returns AI Card instance or null on failure
- */
-async function createAICard(
-  config: DingTalkConfig,
-  conversationId: string,
-  data: DingTalkInboundMessage,
-  accountId: string,
-  log?: Logger
-): Promise<AICardInstance | null> {
-  try {
-    const token = await getAccessToken(config, log);
-    // Use crypto.randomUUID() for robust GUID generation instead of Date.now() + random
-    const cardInstanceId = `card_${randomUUID()}`;
-
-    log?.info?.(`[DingTalk][AICard] Creating and delivering card outTrackId=${cardInstanceId}`);
-    log?.debug?.(`[DingTalk][AICard] conversationType=${data.conversationType}, conversationId=${conversationId}`);
-
-    const isGroup = conversationId.startsWith('cid');
-
-    if (!config.cardTemplateId) {
-      throw new Error('DingTalk cardTemplateId is not configured.');
-    }
-
-    // Build the createAndDeliver request body
-    const createAndDeliverBody = {
-      cardTemplateId: config.cardTemplateId,
-      outTrackId: cardInstanceId,
-      cardData: {
-        cardParamMap: {},
-      },
-      callbackType: 'STREAM',
-      imGroupOpenSpaceModel: { supportForward: true },
-      imRobotOpenSpaceModel: { supportForward: true },
-      openSpaceId: isGroup ? `dtv1.card//IM_GROUP.${conversationId}` : `dtv1.card//IM_ROBOT.${conversationId}`,
-      userIdType: 1,
-      imGroupOpenDeliverModel: isGroup ? { robotCode: config.robotCode || config.clientId } : undefined,
-      imRobotOpenDeliverModel: !isGroup ? { spaceType: 'IM_ROBOT' } : undefined,
-    };
-
-    if (isGroup && !config.robotCode) {
-      log?.warn?.(
-        '[DingTalk][AICard] robotCode not configured, using clientId as fallback. ' +
-          'For best compatibility, set robotCode explicitly in config.'
-      );
-    }
-
-    log?.debug?.(
-      `[DingTalk][AICard] POST /v1.0/card/instances/createAndDeliver body=${JSON.stringify(createAndDeliverBody)}`
-    );
-    const resp = await axios.post(`${DINGTALK_API}/v1.0/card/instances/createAndDeliver`, createAndDeliverBody, {
-      headers: { 'x-acs-dingtalk-access-token': token, 'Content-Type': 'application/json' },
-    });
-    log?.debug?.(
-      `[DingTalk][AICard] CreateAndDeliver response: status=${resp.status} data=${JSON.stringify(resp.data)}`
-    );
-
-    // Cache the AI card instance with config reference for token refresh
-    const aiCardInstance: AICardInstance = {
-      cardInstanceId,
-      accessToken: token,
-      conversationId,
-      createdAt: Date.now(),
-      lastUpdated: Date.now(),
-      state: AICardStatus.PROCESSING, // Initial state after creation
-      config, // Store config reference for token refresh
-    };
-    aiCardInstances.set(cardInstanceId, aiCardInstance);
-
-    // Add mapping from target to active card ID (accountId:conversationId -> cardInstanceId)
-    const targetKey = `${accountId}:${conversationId}`;
-    activeCardsByTarget.set(targetKey, cardInstanceId);
-    log?.debug?.(`[DingTalk][AICard] Registered active card mapping: ${targetKey} -> ${cardInstanceId}`);
-
-    return aiCardInstance;
-  } catch (err: any) {
-    log?.error?.(`[DingTalk][AICard] Create failed: ${err.message}`);
-    if (err.response) {
-      log?.error?.(
-        `[DingTalk][AICard] Error response: status=${err.response.status} data=${JSON.stringify(err.response.data)}`
-      );
-    }
-    return null;
-  }
-}
-
-/**
- * Stream update AI Card content using the new DingTalk API
- * Always use isFull=true to fully replace the Markdown content
- * @param card AI Card instance
- * @param content Content to stream
- * @param finished Whether this is the final update (isFinalize=true)
- * @param log Logger instance
- */
-async function streamAICard(
-  card: AICardInstance,
-  content: string,
-  finished: boolean = false,
-  log?: Logger
-): Promise<void> {
-  // Refresh token if it's been more than 1.5 hours since card creation (tokens expire after 2 hours)
-  const tokenAge = Date.now() - card.createdAt;
-  const TOKEN_REFRESH_THRESHOLD = 90 * 60 * 1000; // 1.5 hours in milliseconds
-
-  if (tokenAge > TOKEN_REFRESH_THRESHOLD && card.config) {
-    log?.debug?.('[DingTalk][AICard] Token age exceeds threshold, refreshing...');
-    try {
-      card.accessToken = await getAccessToken(card.config, log);
-      log?.debug?.('[DingTalk][AICard] Token refreshed successfully');
-    } catch (err: any) {
-      log?.warn?.(`[DingTalk][AICard] Failed to refresh token: ${err.message}`);
-      // Continue with old token, let the API call fail if token is invalid
-    }
-  }
-
-  // Call streaming API to update content with full replacement
-  const streamBody: AICardStreamingRequest = {
-    outTrackId: card.cardInstanceId,
-    guid: randomUUID(), // Use crypto.randomUUID() for robust GUID generation
-    key: card.config?.cardTemplateKey || 'content',
-    content: content,
-    isFull: true, // Always full replacement for Markdown content
-    isFinalize: finished, // Set to true on final update to close the streaming channel
-    isError: false,
-  };
-
-  log?.debug?.(
-    `[DingTalk][AICard] PUT /v1.0/card/streaming contentLen=${content.length} isFull=true isFinalize=${finished} guid=${streamBody.guid} payload=${JSON.stringify(streamBody)}`
+function logInboundCounters(log: any, accountId: string, reason: string): void {
+  const stats = getInboundCounters(accountId);
+  log?.info?.(
+    `[${accountId}] Inbound counters (${reason}): received=${stats.received}, acked=${stats.acked}, processed=${stats.processed}, dedupSkipped=${stats.dedupSkipped}, inflightSkipped=${stats.inflightSkipped}, failed=${stats.failed}, noMessageId=${stats.noMessageId}`,
   );
 
   try {
@@ -1403,21 +576,22 @@ async function handleDingTalkMessage(params: HandleDingTalkMessageParams): Promi
   // Files saved via rt.channel.media.saveMediaBuffer are managed automatically
 }
 
-// DingTalk Channel Definition
+// DingTalk Channel Definition (assembly layer).
+// Heavy logic is delegated to service modules for maintainability.
 export const dingtalkPlugin: DingTalkChannelPlugin = {
-  id: 'dingtalk',
+  id: "dingtalk",
   meta: {
-    id: 'dingtalk',
-    label: 'DingTalk',
-    selectionLabel: 'DingTalk (钉钉)',
-    docsPath: '/channels/dingtalk',
-    blurb: '钉钉企业内部机器人，使用 Stream 模式，无需公网 IP。',
-    aliases: ['dd', 'ding'],
+    id: "dingtalk",
+    label: "DingTalk",
+    selectionLabel: "DingTalk (钉钉)",
+    docsPath: "/channels/dingtalk",
+    blurb: "钉钉企业内部机器人，使用 Stream 模式，无需公网 IP。",
+    aliases: ["dd", "ding"],
   },
   configSchema: buildChannelConfigSchema(DingTalkConfigSchema),
   onboarding: dingtalkOnboardingAdapter,
   capabilities: {
-    chatTypes: ['direct', 'group'] as Array<'direct' | 'group'>,
+    chatTypes: ["direct", "group"] as Array<"direct" | "group">,
     reactions: false,
     threads: false,
     media: true,
@@ -1442,12 +616,12 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       return config.accounts && Object.keys(config.accounts).length > 0
         ? Object.keys(config.accounts)
         : isConfigured(cfg)
-          ? ['default']
+          ? ["default"]
           : [];
     },
     resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
       const config = getConfig(cfg);
-      const id = accountId || 'default';
+      const id = accountId || "default";
       const account = config.accounts?.[id];
       const resolvedConfig = account || config;
       const configured = Boolean(resolvedConfig.clientId && resolvedConfig.clientSecret);
@@ -1459,48 +633,53 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         name: resolvedConfig.name || null,
       };
     },
-    defaultAccountId: (): string => 'default',
-    isConfigured: (account: ResolvedAccount): boolean => Boolean(account.config?.clientId && account.config?.clientSecret),
+    defaultAccountId: (): string => "default",
+    isConfigured: (account: ResolvedAccount): boolean =>
+      Boolean(account.config?.clientId && account.config?.clientSecret),
     describeAccount: (account: ResolvedAccount) => ({
       accountId: account.accountId,
-      name: account.config?.name || 'DingTalk',
+      name: account.config?.name || "DingTalk",
       enabled: account.enabled,
       configured: Boolean(account.config?.clientId),
     }),
   },
   security: {
     resolveDmPolicy: ({ account }: any) => ({
-      policy: account.config?.dmPolicy || 'open',
+      policy: account.config?.dmPolicy || "open",
       allowFrom: account.config?.allowFrom || [],
-      policyPath: 'channels.dingtalk.dmPolicy',
-      allowFromPath: 'channels.dingtalk.allowFrom',
-      approveHint: '使用 /allow dingtalk:<userId> 批准用户',
-      normalizeEntry: (raw: string) => raw.replace(/^(dingtalk|dd|ding):/i, ''),
+      policyPath: "channels.dingtalk.dmPolicy",
+      allowFromPath: "channels.dingtalk.allowFrom",
+      approveHint: "使用 /allow dingtalk:<userId> 批准用户",
+      normalizeEntry: (raw: string) => raw.replace(/^(dingtalk|dd|ding):/i, ""),
     }),
   },
   groups: {
-    resolveRequireMention: ({ cfg }: any): boolean => getConfig(cfg).groupPolicy !== 'open',
+    resolveRequireMention: ({ cfg }: any): boolean => getConfig(cfg).groupPolicy !== "open",
     resolveGroupIntroHint: ({ groupId, groupChannel }: any): string | undefined => {
       const parts = [`conversationId=${groupId}`];
-      if (groupChannel) parts.push(`sessionKey=${groupChannel}`);
-      return `DingTalk IDs: ${parts.join(', ')}.`;
+      if (groupChannel) {
+        parts.push(`sessionKey=${groupChannel}`);
+      }
+      return `DingTalk IDs: ${parts.join(", ")}.`;
     },
   },
   messaging: {
-    normalizeTarget: (raw: string) => (raw ? raw.replace(/^(dingtalk|dd|ding):/i, '') : undefined),
-    targetResolver: { looksLikeId: (id: string): boolean => /^[\w+\-/=]+$/.test(id), hint: '<conversationId>' },
+    normalizeTarget: (raw: string) => (raw ? raw.replace(/^(dingtalk|dd|ding):/i, "") : undefined),
+    targetResolver: {
+      looksLikeId: (id: string): boolean => /^[\w+\-/=]+$/.test(id),
+      hint: "<conversationId>",
+    },
   },
   outbound: {
-    deliveryMode: 'direct' as const,
+    deliveryMode: "direct" as const,
     resolveTarget: ({ to }: any) => {
       const trimmed = to?.trim();
       if (!trimmed) {
         return {
           ok: false as const,
-          error: new Error('DingTalk message requires --to <conversationId>'),
+          error: new Error("DingTalk message requires --to <conversationId>"),
         };
       }
-      // Strip group: or user: prefix and resolve original case-sensitive conversationId
       const { targetId } = stripTargetPrefix(trimmed);
       const resolved = resolveOriginalPeerId(targetId);
       return { ok: true as const, to: resolved };
@@ -1514,14 +693,23 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
           const data = result.data as any;
           const messageId = String(data?.processQueryKey || data?.messageId || randomUUID());
           return {
-            channel: 'dingtalk',
+            channel: "dingtalk",
             messageId,
-            meta: result.data ? { data: result.data as unknown as Record<string, unknown> } : undefined,
+            meta: result.data
+              ? { data: result.data as unknown as Record<string, unknown> }
+              : undefined,
           };
         }
-        throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
+        throw new Error(
+          typeof result.error === "string" ? result.error : JSON.stringify(result.error),
+        );
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendText failed');
+        throw new Error(
+          typeof err?.response?.data === "string"
+            ? err.response.data
+            : err?.message || "sendText failed",
+          { cause: err },
+        );
       }
     },
     sendMedia: async ({
@@ -1535,13 +723,15 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       log,
     }: any) => {
       const config = getConfig(cfg, accountId);
-      if (!config.clientId) throw new Error('DingTalk not configured');
+      if (!config.clientId) {
+        throw new Error("DingTalk not configured");
+      }
 
-      // Support mediaPath, filePath, and mediaUrl parameter names
+      // Support mediaPath/filePath/mediaUrl aliases for better CLI compatibility.
       const rawMediaPath = mediaPath || filePath || mediaUrl;
 
       getLogger()?.debug?.(
-        `[DingTalk] sendMedia called: to=${to}, mediaPath=${mediaPath}, filePath=${filePath}, mediaUrl=${mediaUrl}, rawMediaPath=${rawMediaPath}`
+        `[DingTalk] sendMedia called: to=${to}, mediaPath=${mediaPath}, filePath=${filePath}, mediaUrl=${mediaUrl}, rawMediaPath=${rawMediaPath}`,
       );
 
       if (!rawMediaPath) {
@@ -1551,40 +741,49 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
             mediaPath,
             filePath,
             mediaUrl,
-          })}`
+          })}`,
         );
       }
 
-      // Resolve user path to expand ~ and relative paths
-      const actualMediaPath = resolveUserPath(rawMediaPath);
+      const actualMediaPath = resolveRelativePath(rawMediaPath);
 
       getLogger()?.debug?.(
-        `[DingTalk] sendMedia resolved path: rawMediaPath=${rawMediaPath}, actualMediaPath=${actualMediaPath}`
+        `[DingTalk] sendMedia resolved path: rawMediaPath=${rawMediaPath}, actualMediaPath=${actualMediaPath}`,
       );
 
       try {
-        // Detect media type from file extension if not provided
         const mediaType = providedMediaType || detectMediaTypeFromExtension(actualMediaPath);
-
-        // Send as native media via proactive API
-        const result = await sendProactiveMedia(config, to, actualMediaPath, mediaType, { log, accountId });
+        const result = await sendProactiveMedia(config, to, actualMediaPath, mediaType, {
+          log,
+          accountId,
+        });
         getLogger()?.debug?.(
-          `[DingTalk] sendMedia: ${mediaType} file=${actualMediaPath} result: ${JSON.stringify(result)}`
+          `[DingTalk] sendMedia: ${mediaType} file=${actualMediaPath} result: ${JSON.stringify(result)}`,
         );
 
         if (result.ok) {
-          // Extract messageId from DingTalk response for CLI display
           const data = result.data;
-          const messageId = String(result.messageId || data?.processQueryKey || data?.messageId || randomUUID());
+          const messageId = String(
+            result.messageId || data?.processQueryKey || data?.messageId || randomUUID(),
+          );
           return {
-            channel: 'dingtalk',
+            channel: "dingtalk",
             messageId,
-            meta: result.data ? { data: result.data as unknown as Record<string, unknown> } : undefined,
+            meta: result.data
+              ? { data: result.data as unknown as Record<string, unknown> }
+              : undefined,
           };
         }
-        throw new Error(typeof result.error === 'string' ? result.error : JSON.stringify(result.error));
+        throw new Error(
+          typeof result.error === "string" ? result.error : JSON.stringify(result.error),
+        );
       } catch (err: any) {
-        throw new Error(typeof err?.response?.data === 'string' ? err.response.data : err?.message || 'sendMedia failed');
+        throw new Error(
+          typeof err?.response?.data === "string"
+            ? err.response.data
+            : err?.message || "sendMedia failed",
+          { cause: err },
+        );
       }
     },
   },
@@ -1593,15 +792,13 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       const { account, cfg, abortSignal } = ctx;
       const config = account.config;
       if (!config.clientId || !config.clientSecret) {
-        throw new Error('DingTalk clientId and clientSecret are required');
+        throw new Error("DingTalk clientId and clientSecret are required");
       }
 
       ctx.log?.info?.(`[${account.accountId}] Initializing DingTalk Stream client...`);
 
-      // Cleanup orphaned temp files from previous sessions
       cleanupOrphanedTempFiles(ctx.log);
 
-      // Create DWClient with autoReconnect disabled (we'll manage reconnection ourselves)
       const client = new DWClient({
         clientId: config.clientId,
         clientSecret: config.clientSecret,
@@ -1609,64 +806,99 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         keepAlive: true,
       });
 
-      // Disable DWClient's built-in autoReconnect to use our robust ConnectionManager
-      // Access private config to override autoReconnect
+      // Disable built-in reconnect so ConnectionManager owns all retry/backoff behavior.
       (client as any).config.autoReconnect = false;
 
-      // Register message callback listener
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
         const messageId = res.headers?.messageId;
+        const stats = getInboundCounters(account.accountId);
+        stats.received += 1;
         try {
           if (messageId) {
             client.socketCallBackResponse(messageId, { success: true });
+            stats.acked += 1;
           }
           const data = JSON.parse(res.data) as DingTalkInboundMessage;
 
-          // Message deduplication: use bot-scoped key (robotKey:msgId) to prevent cross-bot conflicts
-          // robotKey priority: robotCode (DingTalk's bot identifier) > clientId (app key) > accountId (local ID)
-          // This ensures consistent keys per bot instance (config values remain stable during runtime)
+          // Message deduplication key is bot-scoped to avoid cross-account conflicts.
           const robotKey = config.robotCode || config.clientId || account.accountId;
           const msgId = data.msgId || messageId;
+          const dedupKey = msgId ? `${robotKey}:${msgId}` : undefined;
 
-          // Skip dedup if we don't have a message ID (extremely rare edge case)
-          if (!msgId) {
+          if (!dedupKey) {
             ctx.log?.warn?.(`[${account.accountId}] No message ID available for deduplication`);
-          } else {
-            const dedupKey = `${robotKey}:${msgId}`;
-            if (isMessageProcessed(dedupKey)) {
-              ctx.log?.debug?.(`[${account.accountId}] Skipping duplicate message: ${dedupKey}`);
-              return;
+            stats.noMessageId += 1;
+            await handleDingTalkMessage({
+              cfg,
+              accountId: account.accountId,
+              data,
+              sessionWebhook: data.sessionWebhook,
+              log: ctx.log,
+              dingtalkConfig: config,
+            });
+            stats.processed += 1;
+            if (stats.received % INBOUND_COUNTER_LOG_EVERY === 0) {
+              logInboundCounters(ctx.log, account.accountId, "periodic");
             }
-            markMessageProcessed(dedupKey);
+            return;
           }
 
-          await handleDingTalkMessage({
-            cfg,
-            accountId: account.accountId,
-            data,
-            sessionWebhook: data.sessionWebhook,
-            log: ctx.log,
-            dingtalkConfig: config,
-          });
+          if (isMessageProcessed(dedupKey)) {
+            ctx.log?.debug?.(`[${account.accountId}] Skipping duplicate message: ${dedupKey}`);
+            stats.dedupSkipped += 1;
+            logInboundCounters(ctx.log, account.accountId, "dedup-skipped");
+            return;
+          }
+
+          if (processingDedupKeys.has(dedupKey)) {
+            ctx.log?.debug?.(
+              `[${account.accountId}] Skipping in-flight duplicate message: ${dedupKey}`,
+            );
+            stats.inflightSkipped += 1;
+            logInboundCounters(ctx.log, account.accountId, "inflight-skipped");
+            return;
+          }
+
+          processingDedupKeys.add(dedupKey);
+          try {
+            await handleDingTalkMessage({
+              cfg,
+              accountId: account.accountId,
+              data,
+              sessionWebhook: data.sessionWebhook,
+              log: ctx.log,
+              dingtalkConfig: config,
+            });
+            stats.processed += 1;
+            markMessageProcessed(dedupKey);
+            if (stats.received % INBOUND_COUNTER_LOG_EVERY === 0) {
+              logInboundCounters(ctx.log, account.accountId, "periodic");
+            }
+          } finally {
+            processingDedupKeys.delete(dedupKey);
+          }
         } catch (error: any) {
+          stats.failed += 1;
+          logInboundCounters(ctx.log, account.accountId, "failed");
           ctx.log?.error?.(`[${account.accountId}] Error processing message: ${error.message}`);
         }
       });
 
-      // Track stopped state to prevent duplicate stop operations
-      // The 'stopped' flag guards against multiple termination paths (abort signal, explicit stop)
-      // from executing concurrently and ensures each lifecycle transition updates snapshot only once
+      // Guard against duplicate stop paths (abort signal + explicit stop).
       let stopped = false;
 
-      // Create connection manager configuration
       const connectionConfig: ConnectionManagerConfig = {
         maxAttempts: config.maxConnectionAttempts ?? 10,
         initialDelay: config.initialReconnectDelay ?? 1000,
         maxDelay: config.maxReconnectDelay ?? 60000,
         jitter: config.reconnectJitter ?? 0.3,
         onStateChange: (state: ConnectionState, error?: string) => {
-          if (stopped) return;
-          ctx.log?.debug?.(`[${account.accountId}] Connection state changed to: ${state}${error ? ` (${error})` : ''}`);
+          if (stopped) {
+            return;
+          }
+          ctx.log?.debug?.(
+            `[${account.accountId}] Connection state changed to: ${state}${error ? ` (${error})` : ""}`,
+          );
           if (state === ConnectionState.CONNECTED) {
             ctx.setStatus({
               ...ctx.getStatus(),
@@ -1687,37 +919,43 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
       ctx.log?.debug?.(
         `[${account.accountId}] Connection config: maxAttempts=${connectionConfig.maxAttempts}, ` +
           `initialDelay=${connectionConfig.initialDelay}ms, maxDelay=${connectionConfig.maxDelay}ms, ` +
-          `jitter=${connectionConfig.jitter}`
+          `jitter=${connectionConfig.jitter}`,
       );
 
-      // Create connection manager
-      const connectionManager = new ConnectionManager(client, account.accountId, connectionConfig, ctx.log);
+      const connectionManager = new ConnectionManager(
+        client,
+        account.accountId,
+        connectionConfig,
+        ctx.log,
+      );
 
-      // Setup abort signal handler BEFORE connecting
-      // This allows the abort signal to cancel in-flight connection attempts
+      // Register abort listener before connect() so startup can be cancelled safely.
       if (abortSignal) {
-        // Check if already aborted before we even start
         if (abortSignal.aborted) {
-          ctx.log?.warn?.(`[${account.accountId}] Abort signal already active, skipping connection`);
+          ctx.log?.warn?.(
+            `[${account.accountId}] Abort signal already active, skipping connection`,
+          );
 
-          // Update snapshot: channel aborted before start
           ctx.setStatus({
             ...ctx.getStatus(),
             running: false,
             lastStopAt: getCurrentTimestamp(),
-            lastError: 'Connection aborted before start',
+            lastError: "Connection aborted before start",
           });
 
-          throw new Error('Connection aborted before start');
+          throw new Error("Connection aborted before start");
         }
 
-        abortSignal.addEventListener('abort', () => {
-          if (stopped) return;
+        abortSignal.addEventListener("abort", () => {
+          if (stopped) {
+            return;
+          }
           stopped = true;
-          ctx.log?.info?.(`[${account.accountId}] Abort signal received, stopping DingTalk Stream client...`);
+          ctx.log?.info?.(
+            `[${account.accountId}] Abort signal received, stopping DingTalk Stream client...`,
+          );
           connectionManager.stop();
 
-          // Update snapshot: channel stopped by abort signal
           ctx.setStatus({
             ...ctx.getStatus(),
             running: false,
@@ -1726,13 +964,10 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         });
       }
 
-      // Connect with robust retry logic
       try {
         await connectionManager.connect();
 
-        // Only mark as running if we weren't stopped and the connection is actually established
         if (!stopped && connectionManager.isConnected()) {
-          // Update snapshot: connection successful, channel is now running
           ctx.setStatus({
             ...ctx.getStatus(),
             running: true,
@@ -1740,34 +975,34 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
             lastError: null,
           });
           ctx.log?.info?.(`[${account.accountId}] DingTalk Stream client connected successfully`);
+
+          await connectionManager.waitForStop();
         } else {
-          // Startup was cancelled or connection is not established; do not overwrite stopped snapshot.
           ctx.log?.info?.(
             `[${account.accountId}] DingTalk Stream client connect() completed but channel is ` +
-              `not running (stopped=${stopped}, connected=${connectionManager.isConnected()})`
+              `not running (stopped=${stopped}, connected=${connectionManager.isConnected()})`,
           );
         }
       } catch (err: any) {
         ctx.log?.error?.(`[${account.accountId}] Failed to establish connection: ${err.message}`);
 
-        // Update snapshot: connection failed
         ctx.setStatus({
           ...ctx.getStatus(),
           running: false,
-          lastError: err.message || 'Connection failed',
+          lastError: err.message || "Connection failed",
         });
         throw err;
       }
 
-      // Return stop handler
       return {
         stop: () => {
-          if (stopped) return;
+          if (stopped) {
+            return;
+          }
           stopped = true;
           ctx.log?.info?.(`[${account.accountId}] Stopping DingTalk Stream client...`);
           connectionManager.stop();
 
-          // Update snapshot: channel stopped
           ctx.setStatus({
             ...ctx.getStatus(),
             running: false,
@@ -1780,16 +1015,22 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
     },
   },
   status: {
-    defaultRuntime: { accountId: 'default', running: false, lastStartAt: null, lastStopAt: null, lastError: null },
+    defaultRuntime: {
+      accountId: "default",
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    },
     collectStatusIssues: (accounts: any[]) => {
       return accounts.flatMap((account) => {
         if (!account.configured) {
           return [
             {
-              channel: 'dingtalk',
+              channel: "dingtalk",
               accountId: account.accountId,
-              kind: 'config' as const,
-              message: 'Account not configured (missing clientId or clientSecret)',
+              kind: "config" as const,
+              message: "Account not configured (missing clientId or clientSecret)",
             },
           ];
         }
@@ -1805,7 +1046,7 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
     }),
     probeAccount: async ({ account, timeoutMs }: any) => {
       if (!account.configured || !account.config?.clientId || !account.config?.clientSecret) {
-        return { ok: false, error: 'Not configured' };
+        return { ok: false, error: "Not configured" };
       }
       try {
         const controller = new AbortController();
@@ -1814,7 +1055,9 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
           await getAccessToken(account.config);
           return { ok: true, details: { clientId: account.config.clientId } };
         } finally {
-          if (timeoutId) clearTimeout(timeoutId);
+          if (timeoutId) {
+            clearTimeout(timeoutId);
+          }
         }
       } catch (error: any) {
         return { ok: false, error: error.message };
@@ -1835,30 +1078,6 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
   },
 };
 
-/**
- * Public low-level API exports for the DingTalk channel plugin.
- *
- * - {@link sendBySession} sends a message to DingTalk using a session/webhook
- *   (e.g. replies within an existing conversation).
- * - {@link createAICard} creates and delivers an AI Card using the DingTalk API
- *   (returns AICardInstance for streaming updates). Automatically registers the card
- *   in activeCardsByTarget mapping (accountId:conversationId -> cardInstanceId).
- * - {@link streamAICard} streams content updates to an AI Card
- *   (for real-time streaming message updates).
- * - {@link finishAICard} finalizes an AI Card and sets state to FINISHED
- *   (closes streaming channel and updates card state).
- * - {@link sendMessage} sends a message with automatic mode selection
- *   (text/markdown/card based on config).
- * - {@link uploadMedia} uploads a local media file to DingTalk media server
- *   and returns the media_id for use in messages.
- * - {@link getAccessToken} retrieves (and caches) the DingTalk access token
- *   for the configured application/runtime.
- * - {@link getLogger} retrieves the current global logger instance
- *   (set by handleDingTalkMessage during inbound message processing).
- *
- * These exports are intended to be used by external integrations that need
- * direct programmatic access to DingTalk messaging and authentication.
- */
 export {
   sendBySession,
   createAICard,
@@ -1870,4 +1089,4 @@ export {
   getAccessToken,
   getLogger,
 };
-export { detectMediaTypeFromExtension } from './media-utils';
+export { detectMediaTypeFromExtension } from "./media-utils";

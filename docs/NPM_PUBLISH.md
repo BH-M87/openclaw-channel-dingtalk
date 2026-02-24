@@ -2,6 +2,62 @@
 
 本文档说明如何将 DingTalk 频道插件发布到 npm 供 OpenClaw 用户安装使用。
 
+## GitHub CI 自动发布（推荐）
+
+仓库已提供自动发布工作流：`.github/workflows/npm-publish.yml`
+
+触发条件：
+- 推送任意新 tag 时触发
+
+自动执行内容：
+- 安装依赖
+- 校验 tag 与 `package.json` 的 `version` 同步（支持 `v2.7.0` 与 `2.7.0` 两种 tag 形式）
+- 当 tag 版本为标准 semver 预发布格式（如 `v2.8.0-beta.0`）时，自动发布到 npm `beta` dist-tag
+- 运行 `type-check`、`lint`、`test`
+- 通过后自动执行 `npm publish --access public`
+
+需要在 npm 与 GitHub 完成 Trusted publisher 绑定：
+1. 在 npm 包设置中配置 GitHub Actions Trusted publisher
+2. 确保工作流具备 `id-token: write` 权限（已在本仓库 workflow 配置）
+
+说明：Trusted publisher 模式下，发布步骤不再需要 `NPM_TOKEN` Secret。
+同时不要在仓库/组织变量里注入 `NODE_AUTH_TOKEN` 或 `NPM_TOKEN`，否则 npm 会优先尝试 token 认证，可能导致 OIDC 不生效。
+
+推荐发布命令：
+
+```bash
+# 先更新版本并提交
+npm version patch
+git push origin main --follow-tags
+```
+
+或手动打 tag：
+
+```bash
+# package.json version = 2.7.1 时
+git tag v2.7.1
+git push origin v2.7.1
+```
+
+## Beta 版本发布（CI）
+
+当前 CI 支持标准 semver 预发布版本（`-beta.*`）自动发布到 npm `beta` dist-tag。
+
+推荐流程：
+
+```bash
+# 例如从 2.7.1 生成 2.7.2-beta.0，并自动创建对应 git tag
+npm version prerelease --preid=beta
+
+# 推送代码和 tag，触发 GitHub Actions 自动发布
+git push origin main --follow-tags
+```
+
+CI 行为：
+- tag（去掉可选 `v` 前缀）必须与 `package.json.version` 完全一致
+- 版本包含 `-beta.*` 时，自动执行 `npm publish --access public --tag beta`
+- 非预发布版本自动发布到 `latest`
+
 ## 前置要求
 
 1. **npm 账号**
@@ -146,14 +202,14 @@ npm unpublish @soimy/dingtalk@版本号
 
 ### Q: 如何发布 beta 版本？
 
-**A:** 使用预发布版本号：
+**A:** 推荐走 GitHub CI 自动发布：
 
 ```bash
 # 创建 beta 版本
 npm version prerelease --preid=beta
 
-# 发布为 beta tag
-npm publish --access public --tag beta
+# 推送代码和 tag，CI 将自动发布到 npm beta dist-tag
+git push origin main --follow-tags
 ```
 
 用户可通过以下方式安装：

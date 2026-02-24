@@ -11,11 +11,20 @@
 
 import type {
   OpenClawConfig,
+  OpenClawPluginApi,
   ChannelLogSink as SDKChannelLogSink,
   ChannelAccountSnapshot as SDKChannelAccountSnapshot,
   ChannelGatewayContext as SDKChannelGatewayContext,
   ChannelPlugin as SDKChannelPlugin,
 } from "openclaw/plugin-sdk";
+
+export interface DingtalkPluginModule {
+  id: string;
+  name: string;
+  description?: string;
+  configSchema?: unknown;
+  register?: (api: OpenClawPluginApi) => void | Promise<void>;
+}
 
 /**
  * DingTalk channel configuration (extends base OpenClaw config)
@@ -123,6 +132,20 @@ export interface DingTalkInboundMessage {
   createAt: number;
   text?: {
     content: string;
+    isReplyMsg?: boolean; // 是否是回复消息
+    repliedMsg?: {
+      // 被回复的消息
+      content?: {
+        text?: string;
+        richText?: Array<{
+          msgType?: string;
+          type?: string;
+          content?: string;
+          code?: string;
+          atName?: string;
+        }>;
+      };
+    };
   };
   content?: {
     downloadCode?: string;
@@ -134,7 +157,18 @@ export interface DingTalkInboundMessage {
       atName?: string;
       downloadCode?: string; // For picture type in richText
     }>;
+    quoteContent?: string; // 替代引用格式
   };
+  // Legacy 引用格式
+  quoteMessage?: {
+    msgId?: string;
+    msgtype?: string;
+    text?: { content: string };
+    senderNick?: string;
+    senderId?: string;
+  };
+  // 富媒体引用，仅有消息ID的情况（包括手机端和PC端）
+  originalMsgId?: string;
   conversationType: string;
   conversationId: string;
   conversationTitle?: string;
@@ -456,7 +490,9 @@ const DEFAULT_ACCOUNT_ID = "default";
  */
 export function listDingTalkAccountIds(cfg: OpenClawConfig): string[] {
   const dingtalk = cfg.channels?.dingtalk as DingTalkChannelConfig | undefined;
-  if (!dingtalk) return [];
+  if (!dingtalk) {
+    return [];
+  }
 
   const accountIds: string[] = [];
 
